@@ -3,9 +3,9 @@
  *
  * 运行：node dist/main/cli/doubaoCliEntry.js <command> [options]
  *   commands: list | task <id> | outputs | diagnostics | import-csv | migrate-project-tasks
- *             | parse-video | download-nomark-video
+ *             | parse-video | download-nomark-video | parse-images | download-nomark-images
  *   options : --tasks-file <json>（默认 data/tasks.json）--status --keyword --limit
- *             --url <thread> --out <dir> --index <n>（nomark 视频）
+ *             --url <thread> --out <dir> --index <n> --limit <n>（nomark 媒体）
  */
 import { readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, statSync } from 'node:fs';
 import { dirname, extname, join, resolve } from 'node:path';
@@ -14,6 +14,7 @@ import { buildCliActions } from './doubaoCli';
 import type { Task } from '@doubao-studio/contracts';
 import { createProjectInFile, migrateProjectTasks, requireProject } from './projectTaskMigration';
 import { runDownloadNomarkVideoCli, runParseVideoCli } from './nomarkVideoCli';
+import { runDownloadNomarkImagesCli, runParseImagesCli } from './nomarkImageCli';
 
 /** JSON 文件任务存储（只读面；replace 恒 false —— CLI 无写路径）。 */
 export function createFileTaskStore(filePath: string) {
@@ -102,6 +103,8 @@ export async function runCli(args: string[], write: (s: string) => void = consol
     'migrate-project-tasks': new Set(['tasks-file', 'projects-file', 'source-project-id', 'target-project-id', 'confirm']),
     'parse-video': new Set(['url']),
     'download-nomark-video': new Set(['url', 'out', 'index']),
+    'parse-images': new Set(['url']),
+    'download-nomark-images': new Set(['url', 'out', 'limit']),
     help: new Set(),
   };
   if (invalidArguments || !allowedByCommand[command] || Object.keys(options).some((key) => !allowedByCommand[command].has(key))) {
@@ -221,6 +224,24 @@ export async function runCli(args: string[], write: (s: string) => void = consol
     return { exitCode: result.ok ? 0 : 1, output };
   }
 
+  if (command === 'parse-images') {
+    const result = await runParseImagesCli({ url: options.url });
+    const output = JSON.stringify(result);
+    write(output);
+    return { exitCode: result.ok ? 0 : 1, output };
+  }
+
+  if (command === 'download-nomark-images') {
+    const result = await runDownloadNomarkImagesCli({
+      url: options.url,
+      out: options.out ? resolve(options.out) : undefined,
+      limit: options.limit,
+    });
+    const output = JSON.stringify(result);
+    write(output);
+    return { exitCode: result.ok ? 0 : 1, output };
+  }
+
   const service = new TaskService({ store: createFileTaskStore(tasksFile), defaultProjectId: () => 'default' });
   const cli = buildCliActions(service);
 
@@ -243,7 +264,7 @@ export async function runCli(args: string[], write: (s: string) => void = consol
       result = cli.diagnostics();
       break;
     case 'help':
-      write('doubao-cli <list|task <id>|outputs|diagnostics|import-csv|migrate-project-tasks|parse-video|download-nomark-video> [options]');
+      write('doubao-cli <list|task <id>|outputs|diagnostics|import-csv|migrate-project-tasks|parse-video|download-nomark-video|parse-images|download-nomark-images> [options]');
       return { exitCode: 0, output: 'help' };
     default:
       result = { ok: false, error: 'UNKNOWN_COMMAND' };

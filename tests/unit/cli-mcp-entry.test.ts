@@ -67,11 +67,15 @@ describe('CLI 入口接线', () => {
     expect(after.length).toBe(1);
   });
 
-  it('parse-video 命令已注册（缺 url 返回 INVALID_ARGUMENTS）', async () => {
+  it('parse-video / parse-images 命令已注册（缺 url 返回 INVALID_ARGUMENTS）', async () => {
     const out: string[] = [];
     const result = await runCli(['parse-video'], (s) => out.push(s));
     expect(result.exitCode).toBe(1);
     expect(JSON.parse(out[0]).error).toBe('INVALID_ARGUMENTS');
+    const out2: string[] = [];
+    const result2 = await runCli(['parse-images'], (s) => out2.push(s));
+    expect(result2.exitCode).toBe(1);
+    expect(JSON.parse(out2[0]).error).toBe('INVALID_ARGUMENTS');
   });
 });
 
