@@ -4,12 +4,16 @@ import type { AddressInfo } from 'net';
 import type { Account, Project, Task, TaskArtifact } from '@doubao-studio/contracts';
 import type { ControlCommandResult, ControlTaskAction } from './controlTypes';
 
+import { handleWorkerGeneration, type WorkerGenerationAPI } from './WorkerGenerationRoutes';
+
 const API_VERSION = 'v1';
 const UNBATCHED = '_unbatched';
 const MAX_BODY_BYTES = 16 * 1024;
 const SAFE_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 
 export interface LocalControlDependencies {
+  worker?: WorkerGenerationAPI;
+  workerIdentity?: { profileHash: string; assetRootHash: string };
   token: string;
   expiresAtMs: number;
   listProjects: () => Project[];
@@ -137,13 +141,13 @@ function sanitizeArtifact(artifact: TaskArtifact, task: Task, accounts: Account[
   };
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJson(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > MAX_BODY_BYTES) throw new Error('BODY_TOO_LARGE');
+    if (size > maxBytes) throw new Error('BODY_TOO_LARGE');
     chunks.push(buffer);
   }
   if (chunks.length === 0) return {};
@@ -254,8 +258,11 @@ export class LocalControlServer {
       }
       if (req.method === 'GET' && parts[1] === 'health' && parts.length === 2) {
         const rendererReady = this.deps.isRendererReady();
-        send(res, 200, { ok: true, ready: rendererReady, rendererReady, protocolVersion: API_VERSION, pid: process.pid, time: this.now() });
+        send(res, 200, { ok: true, ready: rendererReady, rendererReady, protocolVersion: API_VERSION, pid: process.pid, profileHash: this.deps.workerIdentity?.profileHash, assetRootHash: this.deps.workerIdentity?.assetRootHash, workerProtocol: this.deps.worker ? 'worker-v1' : undefined, workerBusy: this.deps.worker ? this.deps.listTasks().some((task) => ['executing', 'generating', 'waiting_generation_confirmation', 'manual_submission_observing'].includes(task.status) || (task.status === 'paused' && !!task.runtime?.submittedAt)) : undefined, time: this.now() });
         return;
+      }
+      if (parts[1] === 'worker' && parts[2] === 'generations' && this.deps.worker) {
+        await handleWorkerGeneration(req, res, parts, this.deps.worker, (request) => readJson(request, 64 * 1024), send); return;
       }
       const projects = this.deps.listProjects();
       const tasks = this.deps.listTasks();

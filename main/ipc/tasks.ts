@@ -4,8 +4,8 @@
  * 负责：任务队列管理、状态流转、批量操作、生成模式
  */
 
-import { ipcMain, dialog, session } from 'electron';
-import { readJSON, writeJSON } from '../utils/store';
+import { ipcMain, dialog, session, webContents } from 'electron';
+import { getDataDir, readJSON, writeJSON } from '../utils/store';
 import { normalizeTasks, normalizeDownloadJobs } from '../utils/persistenceNormalization';
 import { validateDownloadResponse, classifyDownloadException } from '../utils/downloadValidation';
 import { resolvePublicShareMedia } from '../utils/publicShareMedia';
@@ -16,6 +16,9 @@ import { recoverInterruptedDownloads, removeExactDownloadPart } from '../utils/d
 import { TaskEventStream } from '../core/TaskEventStream';
 import { TaskRepository } from '../core/TaskRepository';
 import { TaskService } from '../core/TaskService';
+import { WorkerGenerationService } from '../core/WorkerGenerationService';
+import { dispatchWorkerConfirmation } from '../control/WorkerConfirmation';
+import type { WorkerGenerationAPI } from '../control/WorkerGenerationRoutes';
 import type { ArtifactProbeResult } from '../core/TaskService';
 import type {
   Task,
@@ -323,8 +326,22 @@ export async function downloadArtifactForLocalControl(
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
       },
       signal: controller.signal,
-    }).finally(() => clearTimeout(timeout));
-    const buffer = Buffer.from(await response.arrayBuffer());
+    }).catch((error: unknown) => { clearTimeout(timeout); throw error; });
+    const buffer = await (async (): Promise<Buffer> => {
+      const declared = Number(response.headers.get('content-length') || 0);
+      if (!response.body || declared > 256 * 1024 * 1024) throw new Error('DOWNLOAD_TOO_LARGE');
+      const reader = response.body.getReader();
+      const chunks: Buffer[] = []; let size = 0;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read(); if (done) break;
+          size += value.byteLength;
+          if (size > 256 * 1024 * 1024) { controller.abort(); throw new Error('DOWNLOAD_TOO_LARGE'); }
+          chunks.push(Buffer.from(value));
+        }
+        return Buffer.concat(chunks);
+      } finally { reader.releaseLock(); }
+    })().finally(() => clearTimeout(timeout));
     const contentType = response.headers.get('content-type') || '';
     const validation = validateDownloadResponse(response.status, contentType, buffer.length, task.mode);
     if (!validation.valid) throw new Error(validation.message || 'DOWNLOAD_VALIDATION_FAILED');
@@ -338,7 +355,7 @@ export async function downloadArtifactForLocalControl(
     }
     const filePath = getAvailableDownloadPath(fs, path, saveDir, `${task.id.substring(0, 8)}_${artifact.id.substring(0, 8)}${ext}`);
     temporaryPath = `${filePath}.${job.id}.part`;
-    fs.writeFileSync(temporaryPath, buffer);
+    fs.writeFileSync(temporaryPath, buffer, { mode: 0o600 });
     fs.renameSync(temporaryPath, filePath);
     job.status = 'done';
     job.filePath = filePath;
@@ -368,10 +385,32 @@ const TASK_IPC_CHANNELS = [
   'tasks:readFileAsBase64', 'tasks:downloadOutputs', 'tasks:downloadPublicShareMedia', 'tasks:listDownloads',
   'tasks:exportDiagnostics', 'tasks:validateArtifact', 'tasks:saveAdapterReport',
   'tasks:selectAdapterRules', 'settings:get', 'settings:save', 'tasks:selectSaveDir',
+  'tasks:trustedClick',
 ] as const;
 
 export function registerTaskIPC(): () => void {
   const dispose = replaceIpcHandlers(ipcMain, TASK_IPC_CHANNELS);
+  // 2026-10: doubao composer 只认可信输入；经 WebContents.debugger 派发真实鼠标事件
+  // （坐标为 guest 视口内坐标，与 CDP 实测行为一致）。
+  ipcMain.handle('tasks:trustedClick', async (event, params: { webContentsId: number; x: number; y: number }) => {
+    try {
+      const wc = webContents.fromId(params.webContentsId);
+      if (!wc || wc.isDestroyed() || wc.getType() !== 'webview' || wc.hostWebContents?.id !== event.sender.id ||
+          !/^https:\/\/(?:www\.)?doubao\.com\//.test(wc.getURL()) || !Number.isFinite(params.x) || !Number.isFinite(params.y) || params.x < 0 || params.y < 0) {
+        return { success: false, error: 'webcontents unavailable' };
+      }
+      const attachedHere = !wc.debugger.isAttached();
+      if (attachedHere) wc.debugger.attach('1.3');
+      try {
+      await wc.debugger.sendCommand('Input.dispatchMouseEvent', { type: 'mouseMoved', x: params.x, y: params.y });
+      await wc.debugger.sendCommand('Input.dispatchMouseEvent', { type: 'mousePressed', x: params.x, y: params.y, button: 'left', buttons: 1, clickCount: 1 });
+      await wc.debugger.sendCommand('Input.dispatchMouseEvent', { type: 'mouseReleased', x: params.x, y: params.y, button: 'left', buttons: 0, clickCount: 1 });
+      return { success: true };
+      } finally { if (attachedHere && wc.debugger.isAttached()) wc.debugger.detach(); }
+    } catch (e: unknown) {
+      return { success: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
   const recoveryResult = taskService.recoverInterruptedTasks();
   if (!recoveryResult.success) {
     dispose();
@@ -957,4 +996,102 @@ export function registerTaskIPC(): () => void {
 
   console.log('[IPC] 任务调度模块已注册');
   return dispose;
+}
+
+/** 专用 Worker API 使用正式任务仓储，禁止运行时由外部进程改 tasks.json。 */
+export function createWorkerGenerationAPI(
+  dispatch: (task: Task, action: 'start' | 'observe') => Promise<boolean>,
+): WorkerGenerationAPI {
+  const fs = require('fs') as typeof import('fs');
+  const path = require('path') as typeof import('path');
+  const dataDir = getDataDir();
+  const ledger = path.join(dataDir, 'tasks.json');
+  const marker = path.join(dataDir, '.worker-ledger-initialized');
+  if (!fs.existsSync(ledger)) {
+    if (fs.existsSync(marker)) throw new Error('WORKER_LEDGER_MISSING');
+    if (!writeJSON('tasks.json', [])) throw new Error('WORKER_LEDGER_UNAVAILABLE');
+  }
+  const syncLedger = (): void => {
+    const fd = fs.openSync(ledger, 'r'); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    const dir = fs.openSync(dataDir, 'r'); try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
+  };
+  syncLedger();
+  if (!fs.existsSync(marker)) {
+    const fd = fs.openSync(marker, 'wx', 0o600); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    syncLedger();
+  }
+  const service = new WorkerGenerationService({
+    read: () => {
+      // No fallback-to-empty/backup can authoritatively mean "not submitted".
+      const raw: unknown = JSON.parse(fs.readFileSync(ledger, 'utf8'));
+      if (!Array.isArray(raw) || raw.some((t: unknown) => !t || typeof t !== 'object' || typeof (t as {id?:unknown}).id !== 'string')) throw new Error('WORKER_LEDGER_CORRUPT');
+      return taskRepository.read();
+    },
+    replace: (tasks) => { if (!taskRepository.replace(tasks)) return false; syncLedger(); return true; },
+  });
+  const inFlight = new Set<string>();
+  return {
+    lookup: (key) => service.lookup(key),
+    submit: (key, input) => {
+      const fs = require('fs') as typeof import('fs');
+      const path = require('path') as typeof import('path');
+      const root = process.env.MEDIA_WORKER_STUDIO_ASSET_ROOT;
+      if (!root || !input.images || input.images.length !== 1) throw new Error('WORKER_ASSET_ROOT_REQUIRED');
+      const resolvedRoot = fs.realpathSync(root);
+      const image = fs.realpathSync(input.images[0]);
+      const relative = path.relative(resolvedRoot, image);
+      const stat = fs.statSync(image);
+      if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || !stat.isFile() || stat.size > 16 * 1024 * 1024 || stat.size <= 0) throw new Error('WORKER_IMAGE_INVALID');
+      const accounts = readJSON<Array<{ id: string; platform?: string }>>('accounts.json', []);
+      if (!accounts.some((a) => a.id === input.accountId && (!a.platform || a.platform === 'doubao'))) throw new Error('WORKER_ACCOUNT_REQUIRED');
+      return service.ensure(key, input);
+    },
+    advance: async (key) => {
+      if (inFlight.has(key)) return;
+      inFlight.add(key);
+      try {
+        const task = service.lookup(key);
+        if (!task) throw new Error('WORKER_NOT_FOUND');
+        if (task.status === 'queued' && service.claim(key, 'startIntentAt')) {
+          if (!await dispatch(task, 'start')) throw new Error('START_UNCONFIRMED');
+        } else if (task.status === 'manual_submission_observing') {
+          await dispatch(task, 'observe');
+        } else if (task.status === 'waiting_generation_confirmation') {
+          await confirmWorkerGeneration(task, () => service.claim(key, 'confirmationIntentAt'));
+          await dispatch(task, 'observe');
+        }
+      } finally { inFlight.delete(key); }
+    },
+    artifact: async (key, artifactId) => {
+      const task = service.lookup(key);
+      if (!task || task.status !== 'done' || !task.artifacts?.some((a) => a.id === artifactId && a.kind === 'video')) throw new Error('WORKER_ARTIFACT_REQUIRED');
+      const locator = { projectId: task.projectId || 'default-project', batchId: task.batchId || '_unbatched', taskId: task.id, artifactId };
+      const result = await downloadArtifactForLocalControl(locator);
+      if (!result.success || !result.jobId) throw new Error('WORKER_DOWNLOAD_UNCONFIRMED');
+      const job = loadDownloadJobs().find((j) => j.id === result.jobId && j.taskId === task.id && j.status === 'done');
+      if (!job?.filePath || !job.bytes || job.bytes > 256 * 1024 * 1024) throw new Error('WORKER_DOWNLOAD_UNCONFIRMED');
+      const fs = require('fs') as typeof import('fs');
+      const stat = fs.statSync(job.filePath);
+      if (!stat.isFile() || stat.size !== job.bytes) throw new Error('WORKER_DOWNLOAD_UNCONFIRMED');
+      return fs.readFileSync(job.filePath);
+    },
+  };
+}
+
+async function confirmWorkerGeneration(task: Task, claim: () => boolean): Promise<void> {
+  const target = task.runtime?.conversationUrl;
+  const account = readJSON<Array<{id: string; partition: string}>>('accounts.json', []).find((a) => a.id === task.assignedAccountId);
+  if (!target || !account || !/^https:\/\/www\.doubao\.com\/chat\/[A-Za-z0-9_-]+/.test(target)) throw new Error('EXACT_CONVERSATION_REQUIRED');
+  const expectedSession = session.fromPartition(`persist:doubao_${account.partition}`);
+  const candidates = webContents.getAllWebContents().filter((wc) => !wc.isDestroyed() && wc.getType() === 'webview' && wc.session === expectedSession && wc.getURL() === target);
+  if (candidates.length !== 1) throw new Error('EXACT_CONVERSATION_REQUIRED');
+  const wc = candidates[0];
+  const probe = await wc.executeJavaScript(`(() => {
+    const text = document.body.innerText || '';
+    const editor = document.querySelector('.tiptap.ProseMirror,[contenteditable="true"]');
+    if (!editor || (editor.innerText || '').trim() || !/视频生成参数确认|确认后.{0,16}生成视频/.test(text) || /视频生成已提交|正在生成|生成中|你的视频生成好了/.test(text)) return null;
+    const r = editor.getBoundingClientRect(); return { x: r.left+r.width/2, y: r.top+r.height/2 };
+  })()`) as { x: number; y: number } | null;
+  if (!probe) return;
+  await dispatchWorkerConfirmation(wc, target, probe, claim);
 }

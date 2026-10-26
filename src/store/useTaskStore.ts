@@ -82,6 +82,7 @@ interface TaskState {
 
   // ---- Actions ----
   loadTasks: (recoverInterrupted?: boolean) => Promise<void>;
+  refreshTasks: () => Promise<Task[]>;
   addTasks: (text: string, mode?: GenerationMode, videoConfig?: Task['videoConfig'], attachments?: string[], audioAttachment?: string) => Promise<Task[] | null>;
   importCsv: (filePath?: string) => Promise<{ tasks: Task[]; imported: number; skipped: number; errors: string[] } | null>;
   assignTask: (taskId: string, accountId: string) => Promise<boolean>;
@@ -219,6 +220,13 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   automationState: 'idle',
 
   // ---- 基础操作 ----
+
+  // 控制命令只刷新权威任务投影，不能清空执行槽或账号忙状态。
+  refreshTasks: async () => {
+    const tasks = await window.electronAPI.tasks.list();
+    set({ tasks });
+    return tasks;
+  },
 
   loadTasks: async (recoverInterrupted = false) => {
     set({ loading: true, error: null });

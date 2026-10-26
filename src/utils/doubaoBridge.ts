@@ -32,6 +32,7 @@ export interface WebviewHandle {
   loadURL(url: string): void;
   getURL(): string;
   sendInputEvent?(event: ElectronInputEvent): void;
+  getWebContentsId?(): number;
 }
 
 /** Electron webview sendInputEvent 的键盘事件类型 */
@@ -59,6 +60,31 @@ type ElectronInputEvent = ElectronKeyboardEvent | ElectronMouseEvent;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 2026-10: doubao composer 只认可信输入（isTrusted），页面内合成事件不再生效；
+ * WebviewTag.sendInputEvent 在 Electron 33 webview 上亦不路由到 guest。
+ * 唯一可靠路径：主进程 WebContents.debugger + CDP Input 命令（坐标为 guest 视口内坐标）。
+ */
+export async function trustedWebviewClick(webview: WebviewHandle, x: number, y: number): Promise<void> {
+  const wcId = typeof webview.getWebContentsId === 'function' ? webview.getWebContentsId() : 0;
+  const api = (globalThis as unknown as {
+    electronAPI?: {
+      trustedClick?: (p: { webContentsId: number; x: number; y: number }) => Promise<{ success: boolean; error?: string }>;
+      tasks?: { trustedClick?: (p: { webContentsId: number; x: number; y: number }) => Promise<{ success: boolean; error?: string }> };
+    };
+  }).electronAPI;
+  const trusted = api?.trustedClick ?? api?.tasks?.trustedClick;
+  if (wcId && trusted) {
+    await trusted({ webContentsId: wcId, x, y });
+    return;
+  }
+  if (typeof webview.sendInputEvent === 'function') {
+    webview.sendInputEvent({ type: 'mouseMove', x, y } as ElectronMouseEvent);
+    webview.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 } as ElectronMouseEvent);
+    webview.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 } as ElectronMouseEvent);
+  }
 }
 
 /** 带超时的 executeJavaScript */
@@ -986,7 +1012,7 @@ export async function findSendButtonTarget(webview: WebviewHandle): Promise<Send
             var nearVertical = rect.top <= editorRect.bottom + 80 && rect.bottom >= editorRect.top - 40;
             var square = rect.width >= 24 && rect.width <= 64 && rect.height >= 24 && rect.height <= 64;
             var semantic = /发送|提交|生成|send|submit|generate/.test(descriptor);
-            var rgb = (window.getComputedStyle(control).backgroundColor || '').match(/\d+/g);
+            var rgb = (window.getComputedStyle(control).backgroundColor || '').match(/\\d+/g);
             var accent = !!(rgb && rgb.length >= 3 && Number(rgb[2]) > Number(rgb[0]) && Number(rgb[2]) > Number(rgb[1]) && Number(rgb[2]) > 120);
             if (nearRight && nearVertical && square && (semantic || accent)) {
               matches.push({ el: control, semantic: semantic, accent: accent });
@@ -2739,6 +2765,72 @@ export function switchMode(webview: WebviewHandle, mode: string): void {
  * 豆包统一页面底部输入框下方有「图像」「视频」Tab
  * 注意：必须排除左侧边栏菜单中的同名元素
  */
+/**
+ * 2026-10: doubao composer 只认可信输入事件（isTrusted），页面内合成点击不再生效。
+ * 以「页面内只读探针返回坐标 + sendInputEvent 可信点击 + 权威控件挂载验证」
+ * 的主机侧状态机完成模式切换；探针不修改页面，所有点击均为真实输入。
+ */
+export async function clickAITabTrusted(webview: WebviewHandle, mode: 'image' | 'video'): Promise<boolean> {
+  const tabLabel = mode === 'image' ? '图像生成' : '视频生成';
+  const trustedClickAt = (x: number, y: number): Promise<void> => trustedWebviewClick(webview, x, y);
+  const authoritativeReady = async (): Promise<boolean> => {
+    try {
+      return Boolean(await webview.executeJavaScript(`(function () {
+        var m = document.querySelector('[data-input-engine-actionbar-control-key="video-model"]');
+        var p = document.querySelector('[data-creation-params-panel-id]');
+        return Boolean(m && p && m.getBoundingClientRect().width > 20 && p.getBoundingClientRect().width > 20);
+      })()`));
+    } catch { return false; }
+  };
+  const probePosition = async (text: string, excludeInEngine: boolean): Promise<{ x: number; y: number } | null> => {
+    try {
+      return await webview.executeJavaScript(`(function () {
+        var text = ${JSON.stringify(text)};
+        var els = document.querySelectorAll('button, [role="button"]');
+        for (var i = els.length - 1; i >= 0; i--) {
+          var el = els[i];
+          var r = el.getBoundingClientRect();
+          var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+          if (!(r.width > 30 && r.height > 15 && r.width < 260 && r.top > window.innerHeight * 0.5 && r.bottom <= window.innerHeight + 1)) continue;
+          if (t !== text) continue;
+          if (${excludeInEngine ? 'true' : 'false'} && el.closest('#input-engine-container')) continue;
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        }
+        return null;
+      })()`);
+    } catch { return null; }
+  };
+
+  if (await authoritativeReady()) return true;
+
+  let chip = await probePosition(tabLabel, false);
+  for (let ms = 0; !chip && ms < 20000; ms += 500) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+    chip = await probePosition(tabLabel, false);
+  }
+  if (!chip) return false;
+  await trustedClickAt(chip.x, chip.y);
+  for (let ms = 0; ms < 8000; ms += 400) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 400));
+    if (await authoritativeReady()) return true;
+  }
+
+  const trigger = await probePosition('对话', false);
+  if (trigger) {
+    await trustedClickAt(trigger.x, trigger.y);
+    await new Promise<void>((resolve) => setTimeout(resolve, 1200));
+    const option = await probePosition(tabLabel, true);
+    if (option) {
+      await trustedClickAt(option.x, option.y);
+      for (let ms = 0; ms < 15000; ms += 500) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 500));
+        if (await authoritativeReady()) return true;
+      }
+    }
+  }
+  return await authoritativeReady();
+}
+
 export async function clickAITab(webview: WebviewHandle, mode: 'image' | 'video'): Promise<boolean> {
   const tabLabel = mode === 'image' ? '图像生成' : '视频生成';
   const code = `
@@ -2778,7 +2870,7 @@ export async function clickAITab(webview: WebviewHandle, mode: 'image' | 'video'
         async function waitForModeEntry(timeoutMs) {
           var deadline = Date.now() + timeoutMs;
           while (Date.now() < deadline) {
-            var textarea = document.querySelector('textarea');
+            var textarea = document.querySelector('textarea') || document.querySelector('#input-engine-container');
             var textareaRect = textarea ? textarea.getBoundingClientRect() : null;
             var entries = Array.from(document.querySelectorAll('button, [role="tab"], div, span, a'));
             var ready = entries.some(function(el) {
@@ -2797,10 +2889,12 @@ export async function clickAITab(webview: WebviewHandle, mode: 'image' | 'video'
         async function findVisibleModeMenuOption(timeoutMs) {
           var deadline = Date.now() + timeoutMs;
           while (Date.now() < deadline) {
-            var options = Array.from(document.querySelectorAll('#input-engine-container button')).filter(function(el) {
+            var all = Array.from(document.querySelectorAll('button, [role="menuitem"], [role="option"], [role="button"]')).filter(function(el) {
               var r = el.getBoundingClientRect();
               return r.width > 0 && r.height > 0 && (el.innerText || '').replace(/\\s+/g, ' ').trim() === '视频生成';
             });
+            var outside = all.filter(function(el) { return !el.closest('#input-engine-container'); });
+            var options = outside.length > 0 ? outside : all;
             if (options.length > 0) return options[options.length - 1];
             await sleep(250);
           }
@@ -2810,7 +2904,7 @@ export async function clickAITab(webview: WebviewHandle, mode: 'image' | 'video'
           if ('${mode}' !== 'video') {
             return { ok: true, method: initialMethod, tag: initialTag, pos: Math.round(initialRect.left) + ',' + Math.round(initialRect.top) };
           }
-          if (await waitForVideoControls(1500)) {
+          if (await waitForVideoControls(5000)) {
             return { ok: true, method: initialMethod + '-verified', tag: initialTag, pos: Math.round(initialRect.left) + ',' + Math.round(initialRect.top) };
           }
 
@@ -3900,14 +3994,22 @@ export async function inspectGenerationConfirmation(
           var r = el.getBoundingClientRect();
           return r.width > 20 && r.height > 12 && el.offsetParent !== null;
         }
-        var selectors = '[data-message-id],[data-testid*="message"],[class*="message"],[class*="bubble"]';
-        var candidates = Array.from(document.querySelectorAll(selectors)).filter(visible).map(function (node) {
+        var texts = Array.from(document.querySelectorAll('[data-message-id],[data-testid*="message"],[class*="message"],[class*="bubble"]')).filter(visible).map(function (node) {
           return (node.innerText || '').replace(/\\s+/g, ' ').trim();
         }).filter(function (value) {
-          return value.length > 0 && value.length < 3000 &&
-            (/视频生成参数确认/.test(value) || /确认后.{0,16}(?:开始|进行|为你)?生成视频/.test(value) || /回复[“"']?确认[”"']?.{0,16}生成/.test(value));
+          return value.length > 0 && value.length < 3000;
         });
-        return candidates.length ? candidates[candidates.length - 1] : '';
+        var confirmIdx = -1;
+        for (var i = 0; i < texts.length; i++) {
+          if (/视频生成参数确认/.test(texts[i]) || /确认后.{0,16}(?:开始|进行|为你)?生成视频/.test(texts[i]) || /回复[“"']?确认[”"']?.{0,16}生成/.test(texts[i])) confirmIdx = i;
+        }
+        if (confirmIdx < 0) return '';
+        // 确认卡片会永久留在会话历史；只有当卡片之后没有出现任何生成回执时，
+        // 才认为平台仍在等待确认。
+        for (var j = confirmIdx + 1; j < texts.length; j++) {
+          if (/你的视频生成好了|视频生成已提交|正在生成|生成中/.test(texts[j])) return '';
+        }
+        return texts[confirmIdx];
       })()
     `, 5000, 'inspect_generation_confirmation');
     return classifyGenerationConfirmationText(text);
@@ -3978,25 +4080,8 @@ async function configureVideoOptionsV2(
     if (!position) return fail();
     const [x, y] = position.split(',').map(Number);
     if (!Number.isFinite(x) || !Number.isFinite(y)) fail();
-    // webview.sendInputEvent 的坐标在新版嵌套页面会落到宿主视口而非创作页。
-    // 这里按页面内命中元素派发完整指针/鼠标序列，仍只触发用户可见控件。
-    const activated = await safeExecuteJS<boolean>(webview, `
-      (function () {
-        var x = ${x}; var y = ${y};
-        var target = document.elementFromPoint(x, y);
-        if (!target) return false;
-        var r = target.getBoundingClientRect();
-        if (r.width <= 0 || r.height <= 0) return false;
-        var opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
-        try { target.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
-        target.dispatchEvent(new MouseEvent('mousedown', opts));
-        try { target.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
-        target.dispatchEvent(new MouseEvent('mouseup', opts));
-        target.dispatchEvent(new MouseEvent('click', opts));
-        return true;
-      })()
-    `, 5000, `activate_${label}`);
-    if (!activated) fail();
+    // 2026-10: doubao composer 只认可信输入（isTrusted），统一经主进程 debugger 派发真实点击。
+    await trustedWebviewClick(webview, x, y);
     await sleep(80);
   };
 

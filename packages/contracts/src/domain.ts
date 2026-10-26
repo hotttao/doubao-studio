@@ -285,7 +285,16 @@ export interface DownloadJob {
 }
 
 /** 任务数据结构 */
+export interface WorkerBinding {
+  key: string;
+  digest: string;
+  startIntentAt?: string;
+  confirmationIntentAt?: string;
+}
+
 export interface Task {
+  /** 专用 Worker 稳定身份；不含凭据，不向通用控制输出完整输入。 */
+  workerBinding?: WorkerBinding;
   id: string;
   /** 提示词文本 */
   prompt: string;

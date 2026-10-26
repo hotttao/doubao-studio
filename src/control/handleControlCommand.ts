@@ -3,7 +3,7 @@ import type { Task, TaskStatus } from '../types';
 export interface RendererControlCommand {
   commandId: string;
   requestId: string;
-  action: 'start' | 'pause' | 'cancel' | 'retry';
+  action: 'start' | 'pause' | 'cancel' | 'retry' | 'observe';
   projectId: string;
   batchId: string;
   taskId: string;
@@ -57,6 +57,13 @@ export async function handleControlCommand(
       return result(command.commandId, false, 'BATCH_TASK_MISMATCH');
     }
 
+    if (command.action === 'observe') {
+      if (!['manual_submission_observing', 'waiting_generation_confirmation'].includes(task.status) || !task.runtime?.conversationUrl) {
+        return result(command.commandId, false, 'BOUND_OBSERVATION_REQUIRED');
+      }
+      window.dispatchEvent(new CustomEvent('reconcile-task-submission', { detail: { taskId: task.id } }));
+      return result(command.commandId, true, 'OBSERVE_ACCEPTED', true);
+    }
     if (command.action === 'start') {
       const ok = await deps.start(task.id);
       return result(command.commandId, ok, ok ? 'START_ACCEPTED' : classifyControlRejection(deps.getLastError()), ok);

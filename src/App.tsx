@@ -87,7 +87,7 @@ const App: React.FC = () => {
   useEffect(() => {
     const unsubscribe = window.electronAPI.control.onCommand(async (command) => {
       const response = await handleControlCommand(command, {
-        readTasks: () => window.electronAPI.tasks.list(),
+        readTasks: () => useTaskStore.getState().refreshTasks(),
         start: (taskId) => useTaskStore.getState().startAutomation(taskId),
         retry: (taskId) => useTaskStore.getState().retryTask(taskId),
         getLastError: () => useTaskStore.getState().error,

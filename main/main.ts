@@ -10,11 +10,12 @@
  */
 
 import { app, BrowserWindow, ipcMain, session, shell } from 'electron';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { listAccountsForLocalControl, registerAccountIPC } from './ipc/accounts';
 import {
+  createWorkerGenerationAPI,
   assignTaskForLocalControl,
   downloadArtifactForLocalControl,
   listTasksForLocalControl,
@@ -40,6 +41,16 @@ import { getDataDir, readJSON } from './utils/store';
 
 // ==================== 常量 ====================
 
+const workerUserData = process.env.MEDIA_WORKER_STUDIO_USER_DATA;
+if (workerUserData) {
+  if (!path.isAbsolute(workerUserData)) throw new Error('WORKER_USER_DATA_MUST_BE_ABSOLUTE');
+  fs.mkdirSync(workerUserData, { recursive: true, mode: 0o700 });
+  app.setPath('userData', workerUserData);
+}
+const workerIdentity = workerUserData && process.env.MEDIA_WORKER_STUDIO_ASSET_ROOT ? {
+  profileHash: createHash('sha256').update(fs.realpathSync(workerUserData)).digest('hex'),
+  assetRootHash: createHash('sha256').update(fs.realpathSync(process.env.MEDIA_WORKER_STUDIO_ASSET_ROOT)).digest('hex'),
+} : undefined;
 const isDev = !app.isPackaged;
 const PRELOAD_PATH = path.join(__dirname, 'preload.js');
 
@@ -105,6 +116,12 @@ async function startLocalControl(requestedPort: number | null): Promise<void> {
     try { fs.unlinkSync(stalePath); } catch {}
   }
   localControlServer = new LocalControlServer({
+    workerIdentity,
+    worker: workerUserData ? createWorkerGenerationAPI(async (task, action) => {
+      const result = await broker.dispatch({ requestId: `${task.id}:${action}`, action,
+        projectId: task.projectId || 'default-project', batchId: task.batchId || '_unbatched', taskId: task.id });
+      return result.ok;
+    }) : undefined,
     token,
     expiresAtMs,
     listProjects: loadProjects,
@@ -120,6 +137,8 @@ async function startLocalControl(requestedPort: number | null): Promise<void> {
   fs.chmodSync(tokenPath, 0o600);
   writePrivateJson(infoPath, {
     protocolVersion: 'v1',
+    profileHash: workerIdentity?.profileHash,
+    assetRootHash: workerIdentity?.assetRootHash,
     address: '127.0.0.1',
     port,
     pid: process.pid,
@@ -205,7 +224,7 @@ function createMainWindow(): BrowserWindow {
   });
 
   // 加载前端页面。源码开发版缺少 dev server 注入时显示诊断页，禁止静默黑屏。
-  const rendererTarget = resolveRendererStartupTarget(app.isPackaged, process.env.VITE_DEV_SERVER_URL, __dirname);
+  const rendererTarget = resolveRendererStartupTarget(app.isPackaged || !!workerUserData, process.env.VITE_DEV_SERVER_URL, __dirname);
   const rendererLoad = rendererTarget.kind === 'file'
     ? win.loadFile(rendererTarget.value)
     : win.loadURL(rendererTarget.value);

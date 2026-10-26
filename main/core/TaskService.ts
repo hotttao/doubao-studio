@@ -377,6 +377,7 @@ export class TaskService {
     if (!tasks) return { success: false, error: WRITE_ERROR };
     const index = tasks.findIndex((task) => task.id === taskId);
     if (index < 0) return { success: false, error: '任务不存在' };
+    if (tasks[index].workerBinding) return { success: false, error: 'Worker 生成身份必须保留用于幂等恢复，不能删除' };
     if (ACTIVE.has(tasks[index].status)) return { success: false, error: '任务正在执行，请先暂停后再删除' };
     const dependentCount = tasks.filter((task) => task.dependsOnTaskIds?.includes(taskId)).length;
     if (dependentCount > 0) return { success: false, error: `仍有 ${dependentCount} 个任务依赖此任务，请先调整依赖关系` };
@@ -389,6 +390,7 @@ export class TaskService {
     const tasks = this.readTasks();
     if (!tasks) return { success: false, error: WRITE_ERROR };
     const task = tasks.find((item) => item.id === taskId);
+    if (task?.workerBinding) return { success: false, error: 'Worker 任务不能重复生成，请由网关创建新 Attempt' };
     if (!task) return { success: false, error: '任务不存在' };
     if (requiresSubmissionReconciliation(task)) {
       return { success: false, error: '任务存在已提交记录，请先核对平台结果；为避免重复扣费，禁止重新发送' };

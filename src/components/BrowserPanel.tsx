@@ -30,6 +30,7 @@ import {
   switchMode,
   waitForChatReady,
   clickAITab,
+  clickAITabTrusted,
   configureVideoOptions,
   uploadReferenceImages,
   uploadReferenceAudio,
@@ -1336,7 +1337,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
         if (mode === 'image' || mode === 'video') {
           setAccountAutomationState(accountId, 'injecting', '点击' + modeLabel + 'Tab...', 'switching_mode');
           const modeEntryStartedAt = Date.now();
-          const switched = await clickAITab(webview, mode);
+          const switched = mode === 'video' ? await clickAITabTrusted(webview, mode) : await clickAITab(webview, mode);
           modeEntryElapsedMs = Date.now() - modeEntryStartedAt;
           if (!switched) {
             if (mode === 'video') {
@@ -1368,7 +1369,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
               await persistVideoReadiness(error.diagnostic.currentStage || 'model', {
                 ...error.diagnostic, recoveryAttempts: videoReadinessRecoveryAttempts,
               });
-              const recovered = await clickAITab(webview, 'video');
+              const recovered = await clickAITabTrusted(webview, 'video');
               if (!recovered) throw error;
               await pause(750);
               await configure();

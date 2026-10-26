@@ -1,4 +1,4 @@
-export type ControlTaskAction = 'start' | 'pause' | 'cancel' | 'retry';
+export type ControlTaskAction = 'start' | 'pause' | 'cancel' | 'retry' | 'observe';
 
 export interface ControlTaskCommand {
   commandId: string;
