@@ -116,3 +116,8 @@ describe('P0-3 人工提交只读观察边界', () => {
     expect(reconcileBody).not.toContain('cooldownUntil');
   });
 });
+
+it('does not confuse selected files with completed platform attachments', (): void => {
+ expect(isUploadSnapshotReady({inputFileCount:3,visibleAttachmentCount:0,matchingFileNameCount:0,pending:false},3,0)).toBe(false);
+ expect(isUploadSnapshotReady({inputFileCount:3,visibleAttachmentCount:3,matchingFileNameCount:3,pending:false},3,0)).toBe(true);
+});

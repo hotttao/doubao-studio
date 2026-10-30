@@ -20,7 +20,7 @@ export class WorkerGenerationService {
   }
   ensure(key: string, input: WorkerGenerationInput): Task {
     if (!/^[a-f0-9]{64}$/.test(key) || typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 12000 ||
-        !Array.isArray(input.images) || input.images.length !== 1 || typeof input.images[0] !== 'string' || !input.accountId ||
+        !Array.isArray(input.images) || input.images.length === 0 || input.images.some((image) => typeof image !== 'string' || !image.trim()) || !input.accountId ||
         !['seedance-2.5', 'seedance-2.0', 'seedance-2.0-fast', 'seedance-2.0-mini'].includes(input.model) ||
         !/^(?:[4-9]|1[0-5])s$/.test(input.duration) || !['1:1','3:4','4:3','9:16','16:9','21:9'].includes(input.aspectRatio)) {
       throw new Error('INVALID_WORKER_INPUT');

@@ -58,10 +58,11 @@ export async function handleControlCommand(
     }
 
     if (command.action === 'observe') {
-      if (!['manual_submission_observing', 'waiting_generation_confirmation'].includes(task.status) || !task.runtime?.conversationUrl) {
+      const workerReadback = task.status === 'paused' && !!task.workerBinding && ['submission_uncertain', 'manual_review_required'].includes(task.errorInfo?.code || '');
+      if ((!['manual_submission_observing', 'waiting_generation_confirmation'].includes(task.status) && !workerReadback) || !task.runtime?.conversationUrl) {
         return result(command.commandId, false, 'BOUND_OBSERVATION_REQUIRED');
       }
-      window.dispatchEvent(new CustomEvent('reconcile-task-submission', { detail: { taskId: task.id } }));
+      window.dispatchEvent(new CustomEvent('reconcile-task-submission', { detail: { taskId: task.id, automatic: true } }));
       return result(command.commandId, true, 'OBSERVE_ACCEPTED', true);
     }
     if (command.action === 'start') {

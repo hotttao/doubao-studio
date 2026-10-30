@@ -18,14 +18,10 @@ export interface UploadReadinessDiagnostic {
 }
 
 export function getObservedUploadCount(snapshot: UploadReadinessSnapshot, baselineAttachmentCount: number): number {
-  return Math.max(
-    snapshot.inputFileCount,
-    snapshot.matchingFileNameCount,
-    Math.max(0, snapshot.visibleAttachmentCount - baselineAttachmentCount),
-  );
+  return Math.max(0, snapshot.visibleAttachmentCount - baselineAttachmentCount);
 }
 
-/** 上传必须数量足够、无进行中标记，并连续多次保持稳定。 */
+/** input.files 只证明选择文件，不是平台附件完成证据。上传必须数量足够、无进行中标记，并连续多次保持稳定。 */
 export function isUploadSnapshotReady(
   snapshot: UploadReadinessSnapshot,
   expectedCount: number,

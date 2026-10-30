@@ -1,3 +1,4 @@
+import { validateWorkerImages } from '../utils/workerImages';
 /**
  * main/ipc/tasks.ts
  * 任务调度 IPC 处理器
@@ -1030,18 +1031,11 @@ export function createWorkerGenerationAPI(
     replace: (tasks) => { if (!taskRepository.replace(tasks)) return false; syncLedger(); return true; },
   });
   const inFlight = new Set<string>();
+  const lastObservationAt = new Map<string, number>();
   return {
     lookup: (key) => service.lookup(key),
     submit: (key, input) => {
-      const fs = require('fs') as typeof import('fs');
-      const path = require('path') as typeof import('path');
-      const root = process.env.MEDIA_WORKER_STUDIO_ASSET_ROOT;
-      if (!root || !input.images || input.images.length !== 1) throw new Error('WORKER_ASSET_ROOT_REQUIRED');
-      const resolvedRoot = fs.realpathSync(root);
-      const image = fs.realpathSync(input.images[0]);
-      const relative = path.relative(resolvedRoot, image);
-      const stat = fs.statSync(image);
-      if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || !stat.isFile() || stat.size > 16 * 1024 * 1024 || stat.size <= 0) throw new Error('WORKER_IMAGE_INVALID');
+      validateWorkerImages(process.env.MEDIA_WORKER_STUDIO_ASSET_ROOT, input.images);
       const accounts = readJSON<Array<{ id: string; platform?: string }>>('accounts.json', []);
       if (!accounts.some((a) => a.id === input.accountId && (!a.platform || a.platform === 'doubao'))) throw new Error('WORKER_ACCOUNT_REQUIRED');
       return service.ensure(key, input);
@@ -1054,11 +1048,15 @@ export function createWorkerGenerationAPI(
         if (!task) throw new Error('WORKER_NOT_FOUND');
         if (task.status === 'queued' && service.claim(key, 'startIntentAt')) {
           if (!await dispatch(task, 'start')) throw new Error('START_UNCONFIRMED');
-        } else if (task.status === 'manual_submission_observing') {
+        } else if (task.status === 'manual_submission_observing' || task.status === 'waiting_generation_confirmation' ||
+          (task.status === 'paused' && task.runtime?.conversationUrl && ['submission_uncertain', 'manual_review_required'].includes(task.errorInfo?.code || ''))) {
+          // 只回读已绑定会话，不重复启动/发送；防止反复导航、弹窗与重建观察状态。
+          if (Date.now() - (lastObservationAt.get(key) || 0) < 15_000) return;
+          lastObservationAt.set(key, Date.now());
           await dispatch(task, 'observe');
-        } else if (task.status === 'waiting_generation_confirmation') {
-          await confirmWorkerGeneration(task, () => service.claim(key, 'confirmationIntentAt'));
-          await dispatch(task, 'observe');
+          if (task.status === 'waiting_generation_confirmation') {
+            await confirmWorkerGeneration(task, () => service.claim(key, 'confirmationIntentAt'));
+          }
         }
       } finally { inFlight.delete(key); }
     },

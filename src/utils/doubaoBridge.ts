@@ -19,7 +19,7 @@ import { classifyMaterialAuthorizationSnapshot, decideMaterialAuthorizationAutoC
 import type { MaterialAuthorizationState } from './materialAuthorization';
 import { classifyUploadReadinessFailure, getObservedUploadCount, nextStableUploadCount } from './uploadReadiness';
 import type { UploadReadinessDiagnostic, UploadReadinessSnapshot } from './uploadReadiness';
-import { classifyGenerationConfirmationText } from './generationConfirmation';
+import { classifyGenerationConfirmationMessages } from './generationConfirmation';
 import type { GenerationConfirmationEvidence } from './generationConfirmation';
 import { VideoControlReadinessError, waitForVideoControlReadiness } from './videoControlReadiness';
 import type { VideoControlReadinessResult } from './videoControlReadiness';
@@ -3988,7 +3988,7 @@ export async function inspectGenerationConfirmation(
   webview: WebviewHandle,
 ): Promise<GenerationConfirmationEvidence> {
   try {
-    const text = await safeExecuteJS<string>(webview, `
+    const texts = await safeExecuteJS<string[]>(webview, `
       (function () {
         function visible(el) {
           var r = el.getBoundingClientRect();
@@ -3999,20 +3999,10 @@ export async function inspectGenerationConfirmation(
         }).filter(function (value) {
           return value.length > 0 && value.length < 3000;
         });
-        var confirmIdx = -1;
-        for (var i = 0; i < texts.length; i++) {
-          if (/视频生成参数确认/.test(texts[i]) || /确认后.{0,16}(?:开始|进行|为你)?生成视频/.test(texts[i]) || /回复[“"']?确认[”"']?.{0,16}生成/.test(texts[i])) confirmIdx = i;
-        }
-        if (confirmIdx < 0) return '';
-        // 确认卡片会永久留在会话历史；只有当卡片之后没有出现任何生成回执时，
-        // 才认为平台仍在等待确认。
-        for (var j = confirmIdx + 1; j < texts.length; j++) {
-          if (/你的视频生成好了|视频生成已提交|正在生成|生成中/.test(texts[j])) return '';
-        }
-        return texts[confirmIdx];
+        return texts;
       })()
     `, 5000, 'inspect_generation_confirmation');
-    return classifyGenerationConfirmationText(text);
+    return classifyGenerationConfirmationMessages(texts);
   } catch {
     return { state: 'unknown', detectedAt: new Date().toISOString() };
   }
@@ -4429,14 +4419,17 @@ export async function uploadReferenceImages(
       root = root || document.body;
       var inputs = Array.from(root.querySelectorAll('input[type="file"]'));
       var inputFileCount = inputs.reduce(function(max, input) { return Math.max(max, input.files ? input.files.length : 0); }, 0);
-      var attachments = Array.from(root.querySelectorAll('img,[class*="thumb"],[class*="preview"],[class*="attachment"],[class*="upload-item"]')).filter(visible);
+      var attachments = Array.from(root.querySelectorAll('img')).filter(function(img) {
+        return visible(img) && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0;
+      });
+      var visibleAttachmentCount = new Set(attachments.map(function(img) { return img.currentSrc || img.src; })).size;
       var text = (root.innerText || '') + ' ' + attachments.map(function(node) {
         return [node.getAttribute && node.getAttribute('alt'), node.getAttribute && node.getAttribute('title')].filter(Boolean).join(' ');
       }).join(' ');
       var fileNames = ${names};
       var matchingFileNameCount = fileNames.filter(function(name) { return text.indexOf(name) >= 0; }).length;
       var pending = Array.from(root.querySelectorAll('[aria-busy="true"],[class*="uploading"],[class*="progress"],[class*="loading"],[data-status="uploading"]')).some(visible);
-      return { inputFileCount: inputFileCount, visibleAttachmentCount: attachments.length,
+      return { inputFileCount: inputFileCount, visibleAttachmentCount: visibleAttachmentCount,
         matchingFileNameCount: matchingFileNameCount, pending: pending };
     })()
   `;

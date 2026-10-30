@@ -31,7 +31,18 @@ describe('Worker stable generation identity', () => {
     const unavailable = new WorkerGenerationService({ read: (): Task[] => { throw new Error('corrupt'); }, replace: (): boolean => false });
     expect(() => unavailable.lookup(key)).toThrow('corrupt');
     const { service } = fixture();
-    expect(() => service.ensure(key, { ...input, images: ['a', 'b'] })).toThrow('INVALID_WORKER_INPUT');
+    expect(() => service.ensure(key, { ...input, images: [] })).toThrow('INVALID_WORKER_INPUT');
     expect(() => service.ensure(key, { ...input, model: 'unknown' as WorkerGenerationInput['model'] })).toThrow('INVALID_WORKER_INPUT');
   });
+});
+
+it('preserves ordered multiple attachments and binds their order to the stable key', (): void => {
+ const {service,restart,read}=fixture();
+ const request={...input, images:['/private/first.png','/private/second.png']};
+ const task=service.ensure(key,request);
+ expect(task.attachments).toEqual(request.images);
+ expect(restart().ensure(key,request).id).toBe(task.id);
+ expect(read()).toHaveLength(1);
+ expect(()=>restart().ensure(key,{...request,images:[...request.images].reverse()})).toThrow('WORKER_KEY_CONFLICT');
+ expect(()=>restart().ensure('b'.repeat(64),{...request,images:['valid','']})).toThrow('INVALID_WORKER_INPUT');
 });

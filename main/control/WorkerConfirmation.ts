@@ -21,8 +21,31 @@ export async function dispatchWorkerConfirmation(
     await send('Input.insertText', { text: '确认' });
     const readback = await target.executeJavaScript(`(() => { const e = document.querySelector('.tiptap.ProseMirror,[contenteditable="true"]'); return (e?.innerText || '').trim() === '确认'; })()`);
     if (readback !== true) throw new Error('CONFIRMATION_INPUT_UNCONFIRMED');
-    // Chromium composer listens for native keydown, not a synthesized keyDown.
-    await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
-    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+    // 使用页面权威发送按钮，Enter 事件并不证明 composer 已发送。
+    const button = await target.executeJavaScript(`(async () => {
+      for (let i=0; i<12; i++) {
+        const b = document.querySelector('#flow-end-msg-send');
+        if (b && b.offsetParent !== null && !b.disabled && b.getAttribute('aria-disabled') !== 'true' && b.getAttribute('data-disabled') !== 'true') {
+          const r = b.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) return { x: r.left+r.width/2, y: r.top+r.height/2 };
+        }
+        await new Promise(resolve => setTimeout(resolve,250));
+      }
+      return null;
+    })()`) as {x: number; y: number} | null;
+    if (!button || !Number.isFinite(button.x) || !Number.isFinite(button.y)) throw new Error('CONFIRMATION_SEND_CONTROL_UNAVAILABLE');
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: button.x, y: button.y });
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: button.x, y: button.y, button: 'left', buttons: 1, clickCount: 1 });
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: button.x, y: button.y, button: 'left', buttons: 0, clickCount: 1 });
+    const consumed = await target.executeJavaScript(`(async () => {
+      for (let i=0; i<12; i++) {
+        const e=document.querySelector('.tiptap.ProseMirror,[contenteditable="true"]');
+        if (e && !(e.innerText || '').trim()) return true;
+        await new Promise(resolve => setTimeout(resolve,250));
+      }
+      return false;
+    })()`);
+    if (consumed !== true) throw new Error('CONFIRMATION_SEND_UNCONFIRMED');
+
   } finally { if (attachedHere && target.debugger.isAttached()) target.debugger.detach(); }
 }

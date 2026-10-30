@@ -425,7 +425,9 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
     };
 
     const handleSubmissionReconcile = async (event: Event): Promise<void> => {
-      const taskId = (event as CustomEvent<{ taskId: string }>).detail?.taskId;
+      const detail = (event as CustomEvent<{ taskId: string; automatic?: boolean }>).detail;
+      const taskId = detail?.taskId;
+      const automatic = detail?.automatic === true;
       if (!taskId || submissionReconcileRef.current.has(taskId)) return;
       const task = useTaskStore.getState().tasks.find((item) => item.id === taskId);
       if (!requiresSubmissionReconciliation(task)) {
@@ -451,7 +453,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
         message.error('账号页面未能在限定时间内就绪；任务保持原状态，未刷新、未重新发送');
         return;
       }
-      const navigation = await openTaskConversation(webview, conversationTarget.url, { refreshIfAlreadyOpen: true });
+      const navigation = await openTaskConversation(webview, conversationTarget.url, { refreshIfAlreadyOpen: !automatic });
       if (!navigation.ok) {
         submissionReconcileRef.current.delete(taskId);
         message.error('无法安全打开任务绑定的原会话；任务保持原状态，未跳转到新会话');
@@ -514,13 +516,13 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
               },
             },
           });
-          message.warning(waitingMessage);
+          if (!automatic) message.warning(waitingMessage);
           return;
         }
         if (task.status === 'waiting_generation_confirmation') {
           const latestConversationText = await getConversationText(webview);
           const generationStartedAt = await getGenerationStartTime(webview);
-          const hasConfirmationReceipt = /视频生成已提交|正在生成|生成中|你的视频生成好了/.test(latestConversationText) || generationStartedAt > 0;
+          const hasConfirmationReceipt = /视频生成已提交|正在生成|生成中|你的视频生成好了|视频生成好后.{0,24}主动发送/.test(latestConversationText) || generationStartedAt > 0;
           if (!hasConfirmationReceipt) {
             const waitingMessage = '确认页已不可见，但尚未取得生成回执；任务继续等待，不会自动重发';
             await useTaskStore.getState().updateTaskRuntime(taskId, {
@@ -529,7 +531,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
               errorInfo: { code: 'generation_confirmation_required', message: waitingMessage, recoverable: true, detectedAt: new Date().toISOString() },
               runtime: { stage: 'waiting_generation_confirmation', message: waitingMessage, lastHeartbeatAt: new Date().toISOString() },
             });
-            message.warning(waitingMessage);
+            if (!automatic) message.warning(waitingMessage);
             return;
           }
           await useTaskStore.getState().updateTaskRuntime(taskId, {
@@ -564,7 +566,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
               } : task.runtime?.manualObservation,
             },
           });
-          message.warning(pendingMessage);
+          if (!automatic) message.warning(pendingMessage);
           return;
         }
         if (!submissionReconcileUsageRef.current.has(taskId)) {
@@ -589,7 +591,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
             } : task.runtime?.manualObservation,
           },
         });
-        message.error(pauseMessage);
+        if (!automatic) message.error(pauseMessage);
       } finally {
         if (abortControllersRef.current.get(taskId) === observationController) {
           abortControllersRef.current.delete(taskId);
